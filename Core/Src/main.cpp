@@ -112,10 +112,15 @@ void ei_printf(const char *format, ...) {
 //};
 
 #define AXIS_COUNT 3
-#define WINDOW_SIZE 200 // Кількість рядків у вікні (тривалість)
-#define EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE (AXIS_COUNT * WINDOW_SIZE)
+#define SAMPLE_FREQ_HZ 50
+#define SAMPLE_PERIOD_MS (1000 / SAMPLE_FREQ_HZ)
+#define FRAME_SIZE EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE  // 150
+#define STRIDE_MS 181
 
-float features[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];  // float buffer
+float features[FRAME_SIZE];
+uint32_t last_inference_time = 0;
+size_t collected_samples = 0;
+
 
 int get_feature_data(size_t offset, size_t length, float *out_ptr) {
     memcpy(out_ptr, features + offset, length * sizeof(float));
@@ -160,6 +165,7 @@ int main(void)
   setvbuf(stdout, NULL, _IONBF, 0);
   float ax, ay, az;
   uint32_t t0 = HAL_GetTick();
+  last_inference_time = HAL_GetTick();
 
   signal_t signal;
   signal.total_length = sizeof(features) / sizeof(features[0]);
@@ -170,76 +176,93 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-//      if (HAL_GetTick() - t0 >= 20) {  // ~50Hz
-//          t0 = HAL_GetTick();
-//          MPU6050_Read_Accel(&ax, &ay, &az);
-//          //printf("%.2f,%.2f,%.2f\r\n", ax, ay, az);  // Формат для data-forwarder
-//          printf("%.2f,%.2f,%.2f\n", ax, ay, az);  // Формат для data-forwarder
-//      }
+	    // 1. Отримати нові дані
+	    MPU6050_Read_Accel(&ax, &ay, &az);
 
-//	    MPU6050_Read_Accel(&ax, &ay, &az);
-//	    printf("%.2f,%.2f,%.2f\r\n", ax, ay, az);  // Edge Impulse expects this
-//	    HAL_Delay(20);  // ~50Hz (1000 / 20)
+	    // 2. Зрушити масив вліво (на 3 елементи)
+	    memmove(&features[0], &features[AXIS_COUNT], sizeof(float) * (FRAME_SIZE - AXIS_COUNT));
 
-      for (size_t i = 0; i < EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE; i += 3)
-      {
-          MPU6050_Read_Accel(&ax, &ay, &az);
-          features[i] = ax;
-          features[i + 1] = ay;
-          features[i + 2] = az;
-          HAL_Delay(20);  // ~50Hz
+	    // 3. Додати новий семпл в кінець
+	    features[FRAME_SIZE - 3] = ax;
+	    features[FRAME_SIZE - 2] = ay;
+	    features[FRAME_SIZE - 1] = az;
+
+	    // 4. Очікувати наступний семпл (20 мс = 50 Гц)
+	    HAL_Delay(SAMPLE_PERIOD_MS);
+
+	    // 5. Запуск класифікації кожні STRIDE_MS
+	    if (HAL_GetTick() - last_inference_time >= STRIDE_MS) {
+	        last_inference_time = HAL_GetTick();
+
+	        signal.total_length = FRAME_SIZE;
+	        signal.get_data = [](size_t offset, size_t length, float *out_ptr) {
+	            memcpy(out_ptr, features + offset, length * sizeof(float));
+	            return 0;
+	        };
+
+	        ei_impulse_result_t result = { 0 };
+	        EI_IMPULSE_ERROR res = run_classifier(&signal, &result, true);
+	        ei_printf("run_classifier returned: %d\n", res);
+
+	        ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
+	            result.timing.dsp, result.timing.classification, result.timing.anomaly);
+	        ei_printf("[");
+	        for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+	            ei_printf_float(result.classification[ix].value);
+	            if (ix != EI_CLASSIFIER_LABEL_COUNT - 1) ei_printf(", ");
+	        }
+	        #if EI_CLASSIFIER_HAS_ANOMALY == 1
+	            ei_printf(", ");
+	            ei_printf_float(result.anomaly);
+	        #endif
+	        ei_printf("]\n\n");
       }
 
-      ei_impulse_result_t result = { 0 };
-	  EI_IMPULSE_ERROR res = run_classifier(&signal, &result, true);
-	  ei_printf("run_classifier returned: %d\n", res);
+//      HAL_Delay(980);
 
-	  ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
-		  result.timing.dsp, result.timing.classification, result.timing.anomaly);
-
-	  // print the predictions
-	  ei_printf("[");
-      for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-        ei_printf_float(result.classification[ix].value);
-        #if EI_CLASSIFIER_HAS_ANOMALY == 1
-                ei_printf(", ");
-        #else
-                if (ix != EI_CLASSIFIER_LABEL_COUNT - 1) {
-                    ei_printf(", ");
-                }
-        #endif
-            }
-        #if EI_CLASSIFIER_HAS_ANOMALY == 1
-            ei_printf_float(result.anomaly);
-        #endif
-            ei_printf("]\n\n\n");
-
-        //HAL_Delay(1000);
-
-//		for (size_t i = 0; i < EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE; i += 3) {
-//			MPU6050_Read_Accel(&ax, &ay, &az);
-//			features[i + 0] = ax;
-//			features[i + 1] = ay;
-//			features[i + 2] = az;
-//			HAL_Delay(20);  // 50 Гц
-//		}
+//	MPU6050_Read_Accel(&ax, &ay, &az);
+//
+//	// зрушення і вставка
+//	memmove(&features[0], &features[AXIS_COUNT], sizeof(float) * (FRAME_SIZE - AXIS_COUNT));
+//	features[FRAME_SIZE - 3] = ax;
+//	features[FRAME_SIZE - 2] = ay;
+//	features[FRAME_SIZE - 1] = az;
+//
+//	HAL_Delay(SAMPLE_PERIOD_MS);
+//
+//	// лічильник семплів (до 50)
+//	if (collected_samples < FRAME_SIZE) {
+//		collected_samples += AXIS_COUNT;
+//		continue;  // ще не готові
+//	}
+//
+//	if (HAL_GetTick() - last_inference_time >= STRIDE_MS) {
+//		last_inference_time = HAL_GetTick();
+//
+//		signal.total_length = FRAME_SIZE;
+//		signal.get_data = [](size_t offset, size_t length, float *out_ptr) {
+//			memcpy(out_ptr, features + offset, length * sizeof(float));
+//			return 0;
+//		};
 //
 //		ei_impulse_result_t result = { 0 };
-//		signal_t signal;
-//		signal.total_length = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE;
-//		signal.get_data = &get_feature_data;
-//
 //		EI_IMPULSE_ERROR res = run_classifier(&signal, &result, true);
 //
-//		ei_printf("Result: %d\n", res);
+//		ei_printf("run_classifier returned: %d\n", res);
+//		ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
+//			result.timing.dsp, result.timing.classification, result.timing.anomaly);
+//		ei_printf("[");
 //		for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-//			ei_printf("%s:\t", result.classification[ix].label);
 //			ei_printf_float(result.classification[ix].value);
-//			ei_printf("\n");
+//			if (ix != EI_CLASSIFIER_LABEL_COUNT - 1) ei_printf(", ");
 //		}
-//
-//		ei_printf("\n\n");
-//		HAL_Delay(100);
+//		#if EI_CLASSIFIER_HAS_ANOMALY == 1
+//			ei_printf(", ");
+//			ei_printf_float(result.anomaly);
+//		#endif
+//		ei_printf("]\n\n");
+//	}
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
